@@ -1,87 +1,108 @@
 import logging
+import requests
+import datetime
+import pytz
+import schedule
+import time
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import requests
-from datetime import datetime
-import asyncio
-import pytz
 
-TOKEN = "8221475744:AAGTUEjkLl6QVMAzbA8cppIGAJilUP5_4X4"
-API_KEY = "d11cb4cd983342b58f3cc08efc7e31f5"
+# Remplace ces deux clés par les tiennes
+BOT_TOKEN = '8221475744:AAGTUEjkLl6QVMAzbA8cppIGAJilUP5_4X4'
+API_KEY = 'd11cb4cd983342b58f3cc08efc7e31f5'
 
+# Ton ID pour recevoir les notifications chaque jour à 10h
+ADMIN_CHAT_ID = 5774934825
+
+# Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Fonction pour obtenir les matchs du jour
+# === Fonctions d’analyse ===
+def analyse_match(match):
+    home = match['homeTeam']['name']
+    away = match['awayTeam']['name']
+    status = match['status']
+    date = match['utcDate'][:10]
+
+    stats = []
+
+    if status != "FINISHED":
+        return f"🕒 Match prévu : {home} vs {away} le {date}\n"
+
+    score = match['score']
+    full_home = score['fullTime']['home']
+    full_away = score['fullTime']['away']
+
+    stats.append(f"🏟️ {home} {full_home} - {full_away} {away}")
+    stats.append("📊 Statistiques :")
+
+    total_buts = full_home + full_away
+    stats.append(f"➕ Total buts : {total_buts}")
+
+    if full_home > 0 and full_away > 0:
+        stats.append("✅ Les deux équipes ont marqué")
+    else:
+        stats.append("❌ Une seule équipe a marqué")
+
+    # Supposons qu’on récupère les cartons (fake ici)
+    stats.append(f"🟨 Cartons jaunes : {match.get('yellowCards', 'non disponible')}")
+    stats.append(f"🟥 Cartons rouges : {match.get('redCards', 'non disponible')}")
+
+    return "\n".join(stats)
+
+# === Récupération des matchs du jour ===
 def get_today_matches():
-    url = f"https://api.football-data.org/v4/matches"
+    today = datetime.datetime.utcnow().date().isoformat()
+    url = f"https://api.football-data.org/v4/matches?dateFrom={today}&dateTo={today}"
     headers = {"X-Auth-Token": API_KEY}
     response = requests.get(url, headers=headers)
+
     if response.status_code != 200:
-        return "Erreur lors de la récupération des matchs."
-    
+        return ["⚠️ Erreur lors de la récupération des matchs."]
+
     data = response.json()
-    matches = data.get("matches", [])
+    matches = data.get('matches', [])
     if not matches:
-        return "Aucun match prévu aujourd'hui."
-    
-    result = "📅 *Matchs du jour avec statistiques :*\n"
-    for match in matches:
-        home = match["homeTeam"]["name"]
-        away = match["awayTeam"]["name"]
-        score = match["score"]
-        status = match["status"]
-        full_score = f'{score["fullTime"]["home"]} - {score["fullTime"]["away"]}' if score["fullTime"]["home"] is not None else "à venir"
-        both_teams_score = "✅ Oui" if all(score["fullTime"].values()) else "❌ Non"
-        
-        yellow_cards = red_cards = "N/A"
-        stats = match.get("bookings") or []
-        yellow_cards = sum(1 for x in stats if x.get("card") == "YELLOW")
-        red_cards = sum(1 for x in stats if x.get("card") == "RED")
+        return ["Aucun match aujourd'hui."]
 
-        result += f"\n🏟️ {home} vs {away}\n"
-        result += f"⏱️ Statut : {status}\n"
-        result += f"🔢 Score : {full_score}\n"
-        result += f"⚽ Les deux équipes ont marqué ? {both_teams_score}\n"
-        result += f"🟨 Cartons jaunes : {yellow_cards} | 🟥 Cartons rouges : {red_cards}\n"
-        result += "────────────────────────\n"
-    
-    return result
+    return [analyse_match(match) for match in matches]
 
-# Commande manuelle
-async def match_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    result = get_today_matches()
-    await context.bot.send_message(chat_id=chat_id, text=result, parse_mode="Markdown")
+# === Commande /analyse ===
+async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Analyse en cours...")
+    messages = get_today_matches()
+    for msg in messages:
+        await update.message.reply_text(msg)
 
-# Notification automatique à 10h
-async def daily_job(app):
+# === Notification quotidienne à 10h (GMT+1) ===
+async def daily_notification(app):
+    messages = get_today_matches()
+    text = "\n\n".join(messages)
+    await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"📅 Analyse automatique des matchs du jour :\n\n{text}")
+
+# === Planification ===
+def schedule_daily(app):
+    def job():
+        asyncio.run(daily_notification(app))
+
+    schedule.every().day.at("09:00").do(job)  # 10h GMT+1 = 09h UTC
+
     while True:
-        now = datetime.now(pytz.timezone('Africa/Abidjan'))
-        if now.hour == 10 and now.minute == 0:
-            result = get_today_matches()
-            for user_id in USERS:
-                try:
-                    await app.bot.send_message(chat_id=user_id, text="🕙 *Analyse automatique des matchs du jour :*\n\n" + result, parse_mode="Markdown")
-                except Exception as e:
-                    logger.warning(f"Erreur en envoyant à {user_id}: {e}")
-            await asyncio.sleep(60)  # pour ne pas envoyer 60 fois
-        await asyncio.sleep(30)
+        schedule.run_pending()
+        time.sleep(60)
 
-# Stockage utilisateurs (temporaire ici, à améliorer avec BDD si besoin)
-USERS = set()
+# === Lancement du bot ===
+async def start_bot():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("analyse", analyse))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    USERS.add(user_id)
-    await update.message.reply_text("👋 Bienvenue ! Tu recevras les analyses automatiques chaque jour à 10h. Tape /matchs pour voir les matchs d'aujourd'hui.")
+    # Tâche parallèle pour les notifications journalières
+    loop = asyncio.get_event_loop()
+    loop.create_task(asyncio.to_thread(schedule_daily, app))
 
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("matchs", match_handler))
-    asyncio.create_task(daily_job(app))
-    app.run_polling()
+    await app.run_polling()
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(start_bot())
